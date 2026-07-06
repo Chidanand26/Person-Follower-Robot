@@ -15,6 +15,16 @@ USB Camera ──> camera_node ──/image_raw──> detector_node ──/pers
 
 The nodes communicate only through ROS2 topics, so each one is independent. At one point I swapped the detector from HOG to YOLOv8 and no other node had to change — that is the value of clean message interfaces.
 
+## Demo
+
+https://github.com/user-attachments/assets/YOUR_VIDEO_ID
+
+The demo shows the complete ROS2 person-following pipeline running in simulation:
+- Laptop webcam publishes live frames through `camera_node`
+- YOLOv8 detects and tracks the person
+- `controller_node` generates `/cmd_vel` commands using proportional control
+- Robot movement and telemetry are visualized in the Three.js digital twin through rosbridge
+
 ## Stack
 
 - **ROS2 Jazzy**, **Python** (rclpy)
