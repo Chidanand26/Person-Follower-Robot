@@ -4,7 +4,7 @@ My first ROS2 project — a robot that detects a person with a camera and follow
 
 ## Overview/architecture
 
-<img width="1692" height="930" alt="overview" src="https://github.com/user-attachments/assets/6d2a020b-410b-4e04-8fa7-4886e43e620d" />
+<img width="1690" height="931" alt="overview" src="https://github.com/user-attachments/assets/386c5c46-7b39-446a-a251-9a7b4364a497" />
 
                                   
 The nodes communicate only through ROS2 topics, so each one is independent. At one point I swapped the detector from HOG to YOLOv8 and no other node had to change — that is the value of clean message interfaces.
