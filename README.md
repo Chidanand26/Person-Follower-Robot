@@ -2,7 +2,7 @@
 
 My first ROS2 project — a robot that detects a person with a camera and follows them, built end to end with ROS2 Jazzy and Python. Since I don't have hardware yet, it runs in simulation and is visualized through a browser-based 3D digital twin connected over rosbridge.
 
-## Overview
+## Overview/architecture
 
 ```
 USB Camera ──> camera_node ──/image_raw──> detector_node ──/person_position──> controller_node ──/cmd_vel──> Robot
@@ -17,7 +17,7 @@ The nodes communicate only through ROS2 topics, so each one is independent. At o
 
 ## Demo
 
-https://github.com/Chidanand26/Person-Follower-Robot/blob/main/Demo-1080p.mp4
+https://github.com/user-attachments/assets/aeb14cbf-9843-4069-89c1-e0a88eb6b34a
 
 The demo shows the complete ROS2 person-following pipeline running in simulation:
 - Laptop webcam publishes live frames through `camera_node`
