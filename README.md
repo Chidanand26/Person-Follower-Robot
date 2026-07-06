@@ -17,7 +17,7 @@ The nodes communicate only through ROS2 topics, so each one is independent. At o
 
 ## Demo
 
-https://github.com/user-attachments/assets/YOUR_VIDEO_ID
+https://github.com/Chidanand26/Person-Follower-Robot/blob/main/Demo-1080p.mp4
 
 The demo shows the complete ROS2 person-following pipeline running in simulation:
 - Laptop webcam publishes live frames through `camera_node`
