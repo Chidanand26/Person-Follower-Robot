@@ -1,0 +1,6 @@
+# Build logs (regenerated every build, not useful in the repo)
+log/
+
+# Python cache
+__pycache__/
+*.pyc

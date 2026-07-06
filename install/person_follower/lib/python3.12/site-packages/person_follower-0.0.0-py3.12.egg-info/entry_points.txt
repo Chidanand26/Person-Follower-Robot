@@ -1,0 +1,7 @@
+[console_scripts]
+camera_node = person_follower.camera_node:main
+controller_node = person_follower.controller_node:main
+detector_node = person_follower.detector_node:main
+follower_node = person_follower.follower_node:main
+listener_node = person_follower.listener_node:main
+viewer_node = person_follower.viewer_node:main

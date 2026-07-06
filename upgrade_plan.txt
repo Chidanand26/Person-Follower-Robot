@@ -1,0 +1,966 @@
+2. Upgrade Plan
+STEP 1  Extract shared state          → RobotState.js   (single source of truth)
+STEP 2  Extract ROS connection        → connection.js   (connect/disconnect lifecycle)
+STEP 3  Extract all topics            → topics.js       (every pub/sub in ONE place)
+STEP 4  Extract 3D robot + person     → RobotTwin.js    (adds person, goal, path)
+STEP 5  Extract sim physics           → Simulator.js    (adds fake person + auto-follow)
+STEP 6  Extract UI                    → Dashboard.js    (adds modes, camera, person HUD)
+STEP 7  main.js wires it all + adds click-to-goal raycasting
+Data flow (important — understand this):
+
+ROS2 (robot)                    rosbridge              Browser
+─────────────                   ─────────              ───────
+vision_node ──/person_position──► websocket ──► topics.js ──► RobotState ──► RobotTwin (3D)
+odom        ──/odom────────────►    JSON                          │
+camera      ──/camera/...──────►                                  └──► Dashboard (HUD)
+            ◄──/cmd_vel─────────  websocket ◄── topics.js ◄── joystick/keys
+            ◄──/goal_pose───────                          ◄── floor click
+            ◄──/robot_mode──────                          ◄── mode buttons
+The browser never talks DDS directly — rosbridge translates ROS2 messages ↔ JSON over a websocket. That's why later the same dashboard works with real hardware unchanged.
+
+3. The Code
+Project layout:
+
+project/
+├── index.html
+└── src/
+    ├── main.js
+    ├── ros/connection.js
+    ├── ros/topics.js
+    ├── robot/RobotTwin.js
+    ├── robot/RobotState.js
+    ├── ui/Dashboard.js
+    └── simulation/Simulator.js
+index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>NEON-TWIN v2 // PERSON FOLLOWER DECK</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root{ --cy:#00fff7; --mg:#ff00e5; --gr:#39ff14; --rd:#ff2244; --yl:#ffb300; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#02020a;font-family:'Share Tech Mono',monospace;color:var(--cy)}
+  canvas{display:block}
+  #scanlines{position:fixed;inset:0;pointer-events:none;z-index:50;
+    background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px)}
+  #vignette{position:fixed;inset:0;pointer-events:none;z-index:49;
+    background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,10,.85) 100%)}
+  .panel{position:fixed;z-index:60;background:rgba(2,6,20,.72);border:1px solid var(--cy);
+    box-shadow:0 0 14px rgba(0,255,247,.35),inset 0 0 24px rgba(0,255,247,.05);
+    padding:12px 16px;backdrop-filter:blur(6px);border-radius:4px}
+  .panel::before{content:"";position:absolute;top:-1px;left:-1px;width:14px;height:14px;
+    border-top:2px solid var(--mg);border-left:2px solid var(--mg)}
+  .panel::after{content:"";position:absolute;bottom:-1px;right:-1px;width:14px;height:14px;
+    border-bottom:2px solid var(--mg);border-right:2px solid var(--mg)}
+  h1{font-family:Orbitron;font-size:22px;letter-spacing:4px;color:#fff;
+    text-shadow:0 0 8px var(--cy),0 0 24px var(--cy)}
+  .sub{font-size:10px;letter-spacing:3px;color:var(--mg);margin-top:4px;text-shadow:0 0 6px var(--mg)}
+  .ptitle{font-family:Orbitron;font-size:11px;letter-spacing:2px;color:var(--mg);margin-bottom:6px}
+  #titlePanel{top:16px;left:16px}
+  #connPanel{top:16px;right:16px;width:280px;max-height:calc(100vh - 200px);overflow-y:auto}
+  #telemetry{bottom:16px;left:16px;width:265px;font-size:12px}
+  #personPanel{top:16px;left:50%;transform:translateX(-50%);width:250px;font-size:12px;text-align:center}
+  #modePanel{top:150px;left:16px;width:190px}
+  #camPanel{bottom:16px;left:296px;width:294px}
+  #camImg{width:100%;height:160px;object-fit:cover;background:#010513;border:1px solid rgba(0,255,247,.3);display:block}
+  #camOff{font-size:10px;color:var(--yl);text-align:center;padding:4px}
+  #logPanel{bottom:16px;left:606px;width:300px;height:120px;overflow:hidden;font-size:10px;line-height:1.5}
+  #logPanel .l{color:var(--gr)} #logPanel .w{color:#ffb300} #logPanel .e{color:var(--rd)}
+  label{font-size:10px;letter-spacing:2px;color:#7ef;display:block;margin-top:8px}
+  input[type=text]{width:100%;background:#010513;border:1px solid rgba(0,255,247,.4);color:var(--gr);
+    font-family:inherit;font-size:12px;padding:6px;outline:none}
+  input[type=range]{width:100%;accent-color:var(--mg)}
+  .btn{width:100%;margin-top:12px;padding:9px;background:transparent;border:1px solid var(--cy);
+    color:var(--cy);font-family:Orbitron;font-size:13px;letter-spacing:3px;cursor:pointer;transition:.2s}
+  .btn:hover{background:var(--cy);color:#000;box-shadow:0 0 22px var(--cy)}
+  .btn.on{border-color:var(--gr);color:var(--gr)}
+  /* mode selector buttons */
+  .mbtn{display:block;width:100%;margin-top:6px;padding:7px;background:transparent;
+    border:1px solid rgba(0,255,247,.4);color:var(--cy);font-family:Orbitron;font-size:10px;
+    letter-spacing:2px;cursor:pointer;transition:.15s;text-align:left}
+  .mbtn:hover{border-color:var(--mg)}
+  .mbtn.active{background:rgba(0,255,247,.12);border-color:var(--gr);color:var(--gr);
+    box-shadow:0 0 12px rgba(57,255,20,.4)}
+  .mbtn.stop.active{border-color:var(--rd);color:var(--rd);box-shadow:0 0 12px rgba(255,34,68,.5)}
+  .row{display:flex;justify-content:space-between;margin:3px 0}
+  .row b{color:#fff;text-shadow:0 0 6px var(--cy)}
+  #dTrack{font-family:Orbitron;font-size:14px;letter-spacing:2px}
+  #dTrack.following{color:var(--gr);text-shadow:0 0 10px var(--gr)}
+  #dTrack.lost{color:var(--yl)} #dTrack.none{color:#456}
+  #statusDot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--rd);
+    box-shadow:0 0 10px var(--rd);margin-right:6px;vertical-align:middle}
+  #statusDot.ok{background:var(--gr);box-shadow:0 0 12px var(--gr);animation:pulse 1.2s infinite}
+  @keyframes pulse{50%{opacity:.4}}
+  #battWrap{height:10px;border:1px solid var(--cy);margin-top:4px}
+  #battBar{height:100%;width:100%;background:linear-gradient(90deg,var(--rd),var(--gr));transition:width .5s}
+  #estop{position:fixed;bottom:16px;right:16px;z-index:60;width:110px;height:110px;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%,#ff5566,#7a0016);border:3px solid var(--rd);
+    color:#fff;font-family:Orbitron;font-weight:800;font-size:14px;letter-spacing:2px;cursor:pointer;
+    box-shadow:0 0 30px rgba(255,34,68,.7)}
+  #estop.armed{animation:alarm .4s infinite}
+  @keyframes alarm{50%{box-shadow:0 0 60px var(--rd)}}
+  #hint{position:fixed;bottom:140px;right:16px;z-index:60;font-size:10px;text-align:right;
+    color:#5cf;letter-spacing:1px;line-height:1.7}
+  #hint b{color:var(--mg)}
+  #joyZone{position:fixed;bottom:150px;left:50%;transform:translateX(-50%);z-index:60;
+    width:140px;height:140px;border-radius:50%;border:1px solid rgba(0,255,247,.5);
+    background:radial-gradient(circle,rgba(0,255,247,.06),transparent 70%);touch-action:none}
+  #joyKnob{position:absolute;left:50%;top:50%;width:52px;height:52px;border-radius:50%;
+    transform:translate(-50%,-50%);background:radial-gradient(circle at 35% 30%,#7dfffb,#013);
+    border:2px solid var(--cy);box-shadow:0 0 18px var(--cy);pointer-events:none}
+  @media (max-width:1000px){#logPanel,#hint,#personPanel{display:none}#camPanel{display:none}}
+</style>
+</head>
+<body>
+<div id="scanlines"></div><div id="vignette"></div>
+<div class="panel" id="titlePanel">
+  <h1>NEON-TWIN v2</h1>
+  <div class="sub">PERSON FOLLOWER // DIGITAL TWIN</div>
+</div>
+<!-- MODE SELECTOR: publishes std_msgs/String on /robot_mode -->
+<div class="panel" id="modePanel">
+  <div class="ptitle">ROBOT MODE</div>
+  <button class="mbtn active" data-mode="MANUAL">▸ MANUAL</button>
+  <button class="mbtn" data-mode="PERSON_FOLLOW">▸ PERSON FOLLOW</button>
+  <button class="mbtn" data-mode="AUTONOMOUS_NAV">▸ AUTONOMOUS NAV</button>
+  <button class="mbtn stop" data-mode="STOP">▸ STOP</button>
+</div>
+<!-- PERSON TRACKING STATUS -->
+<div class="panel" id="personPanel">
+  <div class="ptitle">TARGET TRACKING</div>
+  <div id="dTrack" class="none">NO TARGET</div>
+  <div class="row"><span>DISTANCE</span><b id="dDist">-- m</b></div>
+  <div class="row"><span>BEARING</span><b id="dBear">--°</b></div>
+</div>
+<div class="panel" id="connPanel">
+  <div style="font-family:Orbitron;font-size:12px;letter-spacing:2px">
+    <span id="statusDot"></span><span id="statusTxt">OFFLINE — SIM MODE</span>
+  </div>
+  <label>ROSBRIDGE URL</label><input type="text" id="wsUrl" value="ws://localhost:9090">
+  <label>CMD_VEL TOPIC</label><input type="text" id="tCmd" value="/cmd_vel">
+  <label>ODOM TOPIC</label><input type="text" id="tOdom" value="/odom">
+  <label>SCAN TOPIC</label><input type="text" id="tScan" value="/scan">
+  <label>PERSON TOPIC</label><input type="text" id="tPerson" value="/person_position">
+  <label>CAMERA TOPIC</label><input type="text" id="tCam" value="/camera/image/compressed">
+  <label>MAX LINEAR <span id="vLin">0.6</span> m/s</label>
+  <input type="range" id="maxLin" min="0.1" max="2" step="0.05" value="0.6">
+  <label>MAX ANGULAR <span id="vAng">1.5</span> rad/s</label>
+  <input type="range" id="maxAng" min="0.2" max="4" step="0.1" value="1.5">
+  <button class="btn" id="connectBtn">▸ ESTABLISH LINK</button>
+</div>
+<div class="panel" id="telemetry">
+  <div class="ptitle">TELEMETRY FEED</div>
+  <div class="row"><span>LIN VEL</span><b id="dLin">0.00 m/s</b></div>
+  <div class="row"><span>ANG VEL</span><b id="dAng">0.00 r/s</b></div>
+  <div class="row"><span>POS X / Y</span><b><span id="dX">0.00</span> / <span id="dY">0.00</span></b></div>
+  <div class="row"><span>YAW</span><b id="dYaw">0.0°</b></div>
+  <div class="row"><span>GOAL</span><b id="dGoal">NONE</b></div>
+  <div class="row"><span>STATUS</span><b id="dStatus">—</b></div>
+  <div class="row"><span>CAMERA</span><b id="dCam">ORBIT</b></div>
+  <div class="row"><span>BATTERY</span><b id="dBatt">--%</b></div>
+  <div id="battWrap"><div id="battBar"></div></div>
+</div>
+<!-- LIVE CAMERA: sensor_msgs/CompressedImage rendered into <img> -->
+<div class="panel" id="camPanel">
+  <div class="ptitle">ROBOT CAMERA</div>
+  <img id="camImg" alt="">
+  <div id="camOff">NO SIGNAL — CONNECT TO ROS</div>
+</div>
+<div class="panel" id="logPanel"><div id="logInner"></div></div>
+<div id="hint">
+  <b>W/S/A/D</b> DRIVE (MANUAL) &nbsp;<b>SHIFT</b> BOOST<br>
+  <b>DOUBLE-CLICK FLOOR</b> SET NAV GOAL<br>
+  <b>C</b> CAMERA &nbsp;<b>SPACE</b> E-STOP
+</div>
+<button id="estop">E-STOP</button>
+<div id="joyZone"><div id="joyKnob"></div></div>
+<script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
+src/robot/RobotState.js
+/**
+ * RobotState.js — THE SINGLE SOURCE OF TRUTH
+ * ============================================
+ * Every module reads/writes this ONE object instead of talking to
+ * each other directly:
+ *
+ *   topics.js  WRITES here when ROS messages arrive
+ *   Simulator  WRITES here when ROS is disconnected
+ *   RobotTwin  READS here to move the 3D model
+ *   Dashboard  READS here to update the HUD
+ *
+ * This is the same idea as a "blackboard" in robotics architectures.
+ */
+export const state = {
+  /* ---- connection ---- */
+  connected: false,
+  estop: false,
+  /* ---- robot mode (published to /robot_mode as std_msgs/String).
+     Your follower_controller node should subscribe to /robot_mode and
+     decide which velocity source wins:
+       MANUAL          -> obey /cmd_vel from this dashboard
+       PERSON_FOLLOW   -> follower_controller computes /cmd_vel itself
+       AUTONOMOUS_NAV  -> Nav2 (or your planner) drives toward /goal_pose
+       STOP            -> publish zero velocity                       */
+  mode: 'MANUAL',
+  /* ---- pose in the ODOM/MAP frame (meters, radians).
+     target = latest value from /odom (raw, jumps)
+     pose   = smoothed value the 3D twin renders (no jumps)          */
+  target: { x: 0, y: 0, yaw: 0 },
+  pose:   { x: 0, y: 0, yaw: 0 },
+  /* ---- velocity command. want = raw joystick, cmd = smoothed ---- */
+  want: { lin: 0, ang: 0 },
+  cmd:  { lin: 0, ang: 0 },
+  limits: { lin: 0.6, ang: 1.5 },
+  /* ---- person target, in the ROBOT frame (base_link):
+     x = meters FORWARD of robot, y = meters LEFT of robot.
+     This matches what your vision_node will output, because a camera
+     detection is naturally relative to the robot, not the world.    */
+  person: {
+    visible: false,
+    x: 0, y: 0,
+    distance: 0,
+    bearing: 0,          // radians, atan2(y, x)
+    lastSeen: 0,         // timestamp — used to detect "TARGET LOST"
+  },
+  /* ---- navigation goal in the WORLD frame (null = no goal) ---- */
+  goal: null,            // { x, y }
+  /* ---- misc telemetry ---- */
+  battery: null,         // percent 0..100
+  robotStatus: '—',      // free text from /robot_status
+  camMode: 0,
+};
+/** Tracking status derived from person data — one place, one rule. */
+export function trackingStatus() {
+  if (!state.person.visible) return 'NO TARGET';
+  // If no detection for > 1s, vision lost the person
+  if (performance.now() - state.person.lastSeen > 1000) return 'LOST';
+  return state.mode === 'PERSON_FOLLOW' ? 'FOLLOWING' : 'DETECTED';
+}
+src/ros/connection.js
+/**
+ * connection.js — ROSBRIDGE WEBSOCKET LIFECYCLE
+ * ==============================================
+ * HOW THE BROWSER TALKS TO ROS2:
+ * A browser cannot speak DDS (ROS2's native transport). Instead we run
+ * `rosbridge_server` on the robot, which exposes a websocket that
+ * translates JSON <-> ROS2 messages. roslibjs is the JS client for it.
+ *
+ *   Browser <--JSON/websocket--> rosbridge <--DDS--> your ROS2 nodes
+ *
+ * This module ONLY manages connect/disconnect. Topics live in topics.js.
+ */
+import { state } from '../robot/RobotState.js';
+let ros = null;
+/**
+ * @param {string} url        e.g. ws://<robot-ip>:9090
+ * @param {object} handlers   { onConnect(ros), onClose(), onError() }
+ */
+export function connect(url, handlers) {
+  ros = new ROSLIB.Ros({ url });
+  ros.on('connection', () => {
+    state.connected = true;
+    state.estop = false;
+    handlers.onConnect(ros);   // main.js sets up all topics here
+  });
+  ros.on('error', () => handlers.onError());
+  ros.on('close', () => {
+    state.connected = false;   // Simulator takes over automatically
+    handlers.onClose();
+  });
+}
+export function disconnect() { if (ros) ros.close(); }
+export function isConnected() { return state.connected; }
+src/ros/topics.js
+/**
+ * topics.js — EVERY ROS TOPIC IN ONE PLACE
+ * =========================================
+ * Matches your architecture:
+ *
+ *   camera_node ──/image_raw──► vision_node ──/person_position──► follower_controller ──/cmd_vel──► base
+ *
+ * DASHBOARD SUBSCRIBES (robot → browser):
+ *   /odom              nav_msgs/Odometry        where the robot IS (drives the twin)
+ *   /scan              sensor_msgs/LaserScan    obstacle points around robot
+ *   /person_position   geometry_msgs/PointStamped  person in ROBOT frame (from vision_node)
+ *   /robot_status      std_msgs/String          free-text status from your nodes
+ *   /battery_state     sensor_msgs/BatteryState power level
+ *   /camera/image/compressed  sensor_msgs/CompressedImage  live JPEG frames
+ *   /plan              nav_msgs/Path            planned path (placeholder for Nav2 later)
+ *
+ * DASHBOARD PUBLISHES (browser → robot):
+ *   /cmd_vel           geometry_msgs/Twist      manual teleop velocity
+ *   /goal_pose         geometry_msgs/PoseStamped  navigation destination (floor click)
+ *   /robot_mode        std_msgs/String          mode selector
+ */
+import { state } from '../robot/RobotState.js';
+const pubs = {};   // publishers
+let subs = [];     // subscribers (kept so we can unsubscribe on disconnect)
+/** Called by main.js right after rosbridge connects. */
+export function initTopics(ros, names, callbacks) {
+  /* ================= PUBLISHERS ================= */
+  pubs.cmd = new ROSLIB.Topic({
+    ros, name: names.cmd, messageType: 'geometry_msgs/msg/Twist',
+  });
+  pubs.goal = new ROSLIB.Topic({
+    ros, name: '/goal_pose', messageType: 'geometry_msgs/msg/PoseStamped',
+  });
+  pubs.mode = new ROSLIB.Topic({
+    ros, name: '/robot_mode', messageType: 'std_msgs/msg/String',
+  });
+  /* ================= SUBSCRIBERS ================= */
+  const sub = (name, messageType, cb, opts = {}) => {
+    const t = new ROSLIB.Topic({ ros, name, messageType, ...opts });
+    t.subscribe(cb);
+    subs.push(t);
+  };
+  /* /odom — the twin's position. We extract yaw from the quaternion.
+     ROS uses quaternions for 3D rotation; for a ground robot only yaw
+     (rotation around Z) matters, so we convert with atan2.           */
+  sub(names.odom, 'nav_msgs/msg/Odometry', (m) => {
+    const p = m.pose.pose.position, q = m.pose.pose.orientation;
+    state.target.x = p.x;
+    state.target.y = p.y;
+    state.target.yaw = Math.atan2(2 * (q.w * q.z + q.x * q.y),
+                                  1 - 2 * (q.y * q.y + q.z * q.z));
+  });
+  /* /scan — array of distances swept from angle_min to angle_max.
+     We convert each (angle, range) to an (x, y) point in robot frame
+     and hand it to the 3D layer via a callback.                      */
+  sub(names.scan, 'sensor_msgs/msg/LaserScan', (m) => callbacks.onScan(m));
+  /* /person_position — OUTPUT OF YOUR FUTURE vision_node.
+     Convention: geometry_msgs/PointStamped in base_link frame,
+       point.x = meters in front of robot
+       point.y = meters to the left
+     Your vision_node computes this from the camera (e.g. bounding box
+     center angle + depth/size estimate) and publishes it.            */
+  sub(names.person, 'geometry_msgs/msg/PointStamped', (m) => {
+    state.person.x = m.point.x;
+    state.person.y = m.point.y;
+    state.person.distance = Math.hypot(m.point.x, m.point.y);
+    state.person.bearing = Math.atan2(m.point.y, m.point.x);
+    state.person.visible = true;
+    state.person.lastSeen = performance.now();
+  });
+  /* /robot_status — publish any string from your nodes, e.g.
+     "SEARCHING", "FOLLOWING @1.2m", "OBSTACLE!" — shows on the HUD.  */
+  sub('/robot_status', 'std_msgs/msg/String', (m) => {
+    state.robotStatus = m.data;
+  });
+  sub('/battery_state', 'sensor_msgs/msg/BatteryState', (m) => {
+    let p = m.percentage;
+    if (p <= 1.001) p *= 100;   // some drivers give 0..1, others 0..100
+    state.battery = p;
+  });
+  /* /camera/image/compressed — JPEG bytes arrive base64-encoded over
+     rosbridge. We simply set them as an <img> src. No decoding needed!
+     throttle_rate: ask rosbridge to send max ~10 fps → saves bandwidth. */
+  sub(names.cam, 'sensor_msgs/msg/CompressedImage',
+      (m) => callbacks.onImage('data:image/jpeg;base64,' + m.data),
+      { throttle_rate: 100 });
+  /* /plan — Nav2 publishes the planned path here. Placeholder now;
+     works automatically once you add Nav2 later.                     */
+  sub('/plan', 'nav_msgs/msg/Path',
+      (m) => callbacks.onPath(m.poses.map(p => ({
+        x: p.pose.position.x, y: p.pose.position.y,
+      }))));
+}
+/** Unsubscribe everything — called on disconnect to avoid leaks. */
+export function teardownTopics() {
+  subs.forEach(t => t.unsubscribe());
+  subs = [];
+}
+/* ================= PUBLISH HELPERS ================= */
+/** Teleop velocity — called at fixed 10 Hz by main.js.
+    IMPORTANT: only meaningful in MANUAL mode; in other modes your
+    follower_controller/Nav2 owns /cmd_vel. E-stop forces zeros.     */
+export function publishCmdVel() {
+  if (!state.connected || !pubs.cmd) return;
+  if (state.mode !== 'MANUAL' && !state.estop) return; // don't fight the controller
+  pubs.cmd.publish(new ROSLIB.Message({
+    linear:  { x: state.estop ? 0 : state.cmd.lin, y: 0, z: 0 },
+    angular: { x: 0, y: 0, z: state.estop ? 0 : state.cmd.ang },
+  }));
+}
+/** Floor click → /goal_pose (what Nav2's "2D Goal Pose" in RViz sends).
+    frame_id 'map' assumes localization; use 'odom' if you have none yet. */
+export function publishGoal(x, y) {
+  if (!state.connected || !pubs.goal) return;
+  pubs.goal.publish(new ROSLIB.Message({
+    header: { frame_id: 'map', stamp: { sec: 0, nanosec: 0 } },
+    pose: {
+      position: { x, y, z: 0 },
+      orientation: { x: 0, y: 0, z: 0, w: 1 },  // identity = "any heading"
+    },
+  }));
+}
+/** Mode button → /robot_mode. Your follower_controller subscribes here. */
+export function publishMode(mode) {
+  if (!state.connected || !pubs.mode) return;
+  pubs.mode.publish(new ROSLIB.Message({ data: mode }));
+}
+src/robot/RobotTwin.js
+/**
+ * RobotTwin.js — EVERYTHING 3D THAT REPRESENTS THE ROBOT'S WORLD
+ * ===============================================================
+ * COORDINATE CONVERSION (memorize this!):
+ *   ROS  : x forward, y LEFT,  z UP      (right-handed, REP-103)
+ *   Three: x right,   y UP,    z toward camera
+ *   Mapping used everywhere:  three.x = ros.x,  three.z = -ros.y
+ */
+import * as THREE from 'three';
+import { state, trackingStatus } from './RobotState.js';
+export class RobotTwin {
+  constructor(scene) {
+    this.scene = scene;
+    /* ---------- robot body group (unchanged from v1) ---------- */
+    this.group = new THREE.Group();
+    scene.add(this.group);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x0a1224, metalness: .9, roughness: .25 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.15, .32, .78), bodyMat);
+    body.position.y = .34; this.group.add(body);
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry),
+      new THREE.LineBasicMaterial({ color: 0x00fff7 }));
+    edges.position.copy(body.position); this.group.add(edges);
+    this.wheels = [];
+    const wGeo = new THREE.CylinderGeometry(.19, .19, .1, 24);
+    const wMat = new THREE.MeshStandardMaterial({ color: 0x05070d, emissive: 0x00fff7, emissiveIntensity: .35 });
+    [[.38, .42], [.38, -.42], [-.38, .42], [-.38, -.42]].forEach(([x, z]) => {
+      const w = new THREE.Mesh(wGeo, wMat);
+      w.rotation.x = Math.PI / 2; w.position.set(x, .19, z);
+      this.group.add(w); this.wheels.push(w);
+    });
+    /* lidar turret + spinning beam */
+    const turret = new THREE.Mesh(new THREE.CylinderGeometry(.14, .16, .16, 20),
+      new THREE.MeshStandardMaterial({ color: 0x111a2e, emissive: 0x39ff14, emissiveIntensity: .5 }));
+    turret.position.y = .68; this.group.add(turret);
+    this.beam = new THREE.Mesh(new THREE.BoxGeometry(3.2, .012, .012),
+      new THREE.MeshBasicMaterial({ color: 0x39ff14, transparent: true, opacity: .55 }));
+    this.beam.position.y = .68; this.group.add(this.beam);
+    /* pulsing ground ring */
+    this.pulse = new THREE.Mesh(new THREE.RingGeometry(.7, .78, 48),
+      new THREE.MeshBasicMaterial({ color: 0xff00e5, transparent: true, side: THREE.DoubleSide }));
+    this.pulse.rotation.x = -Math.PI / 2; this.pulse.position.y = .02; this.group.add(this.pulse);
+    /* ---------- LiDAR point cloud ----------
+       Child of the robot group = points are in the ROBOT frame,
+       exactly like /scan data. When the robot turns, points turn too. */
+    this.MAXPTS = 2000;
+    this.lidarGeo = new THREE.BufferGeometry();
+    this.lidarGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.MAXPTS * 3), 3));
+    this.lidarGeo.setDrawRange(0, 0);
+    const lidar = new THREE.Points(this.lidarGeo,
+      new THREE.PointsMaterial({ color: 0x39ff14, size: .09, transparent: true, opacity: .95 }));
+    lidar.position.y = .68; this.group.add(lidar);
+    /* ---------- NEW: PERSON TARGET ----------
+       Also a child of the robot group, because /person_position is in
+       the ROBOT frame (that's what a camera naturally gives you).     */
+    this.person = new THREE.Group();
+    const pMat = new THREE.MeshStandardMaterial({
+      color: 0x220011, emissive: 0xff00e5, emissiveIntensity: 1.2,
+      transparent: true, opacity: .9,
+    });
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(.18, .6, 8, 16), pMat);
+    torso.position.y = .75; this.person.add(torso);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(.14, 16, 16), pMat);
+    head.position.y = 1.35; this.person.add(head);
+    this.personRing = new THREE.Mesh(new THREE.RingGeometry(.35, .42, 32),
+      new THREE.MeshBasicMaterial({ color: 0xff00e5, transparent: true, side: THREE.DoubleSide }));
+    this.personRing.rotation.x = -Math.PI / 2; this.personRing.position.y = .02;
+    this.person.add(this.personRing);
+    this.person.visible = false;
+    this.group.add(this.person);
+    /* dashed "lock-on" line from robot to person (robot frame) */
+    this.lockGeo = new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(0, .5, 0), new THREE.Vector3(1, .8, 0)]);
+    this.lockLine = new THREE.Line(this.lockGeo,
+      new THREE.LineDashedMaterial({ color: 0xff00e5, dashSize: .15, gapSize: .1, transparent: true, opacity: .8 }));
+    this.lockLine.visible = false;
+    this.group.add(this.lockLine);
+    /* ---------- NEW: GOAL MARKER (world frame → child of scene) ---------- */
+    this.goalMarker = new THREE.Group();
+    const gRing = new THREE.Mesh(new THREE.RingGeometry(.4, .5, 32),
+      new THREE.MeshBasicMaterial({ color: 0x39ff14, transparent: true, side: THREE.DoubleSide }));
+    gRing.rotation.x = -Math.PI / 2; gRing.position.y = .02;
+    this.goalRing = gRing; this.goalMarker.add(gRing);
+    const gPillar = new THREE.Mesh(new THREE.CylinderGeometry(.03, .03, 2.4, 8),
+      new THREE.MeshBasicMaterial({ color: 0x39ff14, transparent: true, opacity: .4 }));
+    gPillar.position.y = 1.2; this.goalMarker.add(gPillar);
+    this.goalMarker.visible = false;
+    scene.add(this.goalMarker);
+    /* ---------- NEW: PLANNED PATH (world frame) ----------
+       Filled from /plan (Nav2) or a straight line in sim mode.       */
+    this.pathGeo = new THREE.BufferGeometry();
+    this.pathGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(500 * 3), 3));
+    this.pathGeo.setDrawRange(0, 0);
+    scene.add(new THREE.Line(this.pathGeo,
+      new THREE.LineBasicMaterial({ color: 0x39ff14, transparent: true, opacity: .7 })));
+    /* ---------- trail (breadcrumbs of where robot has been) ---------- */
+    this.TRAIL = 600; this.trailN = 0;
+    this.trailGeo = new THREE.BufferGeometry();
+    this.trailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.TRAIL * 3), 3));
+    this.trailGeo.setDrawRange(0, 0);
+    scene.add(new THREE.Line(this.trailGeo,
+      new THREE.LineBasicMaterial({ color: 0xff00e5, transparent: true, opacity: .85 })));
+  }
+  /** Feed /scan data (called from topics.js OR Simulator). */
+  setScan(msg) {
+    const pos = this.lidarGeo.attributes.position.array;
+    let n = 0;
+    for (let i = 0; i < msg.ranges.length && n < this.MAXPTS; i++) {
+      const r = msg.ranges[i];
+      if (!isFinite(r) || r <= 0.05 || r > msg.range_max) continue;
+      const a = msg.angle_min + i * msg.angle_increment;
+      // robot frame: ros(x=r·cosa, y=r·sina) → three(x, -z)
+      pos[n * 3] = r * Math.cos(a); pos[n * 3 + 1] = 0; pos[n * 3 + 2] = -r * Math.sin(a);
+      n++;
+    }
+    this.lidarGeo.setDrawRange(0, n);
+    this.lidarGeo.attributes.position.needsUpdate = true;
+  }
+  /** Feed a path: array of {x,y} in world frame. */
+  setPath(points) {
+    const pos = this.pathGeo.attributes.position.array;
+    const n = Math.min(points.length, 500);
+    for (let i = 0; i < n; i++) {
+      pos[i * 3] = points[i].x; pos[i * 3 + 1] = .04; pos[i * 3 + 2] = -points[i].y;
+    }
+    this.pathGeo.setDrawRange(0, n);
+    this.pathGeo.attributes.position.needsUpdate = true;
+  }
+  /** Called every frame by main.js. */
+  update(dt, t) {
+    /* smooth the rendered pose toward the latest odom (no teleporting) */
+    const k = Math.min(1, dt * 10), s = state;
+    s.pose.x += (s.target.x - s.pose.x) * k;
+    s.pose.y += (s.target.y - s.pose.y) * k;
+    let dyaw = s.target.yaw - s.pose.yaw;
+    while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
+    while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
+    s.pose.yaw += dyaw * k;
+    this.group.position.set(s.pose.x, 0, -s.pose.y);
+    this.group.rotation.y = s.pose.yaw;
+    /* person marker — robot frame coords straight from state */
+    const tracking = trackingStatus();
+    const showPerson = s.person.visible && tracking !== 'NO TARGET';
+    this.person.visible = showPerson;
+    this.lockLine.visible = showPerson && tracking === 'FOLLOWING';
+    if (showPerson) {
+      const px = s.person.x, pz = -s.person.y;           // robot frame → three
+      this.person.position.set(px, 0, pz);
+      this.personRing.material.color.set(tracking === 'FOLLOWING' ? 0x39ff14 : 0xff00e5);
+      const pr = 1 + Math.sin(t * 5) * .2;
+      this.personRing.scale.set(pr, pr, pr);
+      // lock-on line endpoints
+      const lp = this.lockGeo.attributes.position.array;
+      lp[3] = px; lp[4] = .8; lp[5] = pz;
+      this.lockGeo.attributes.position.needsUpdate = true;
+      this.lockLine.computeLineDistances();               // needed for dashes
+    }
+    /* goal marker */
+    this.goalMarker.visible = !!s.goal;
+    if (s.goal) {
+      this.goalMarker.position.set(s.goal.x, 0, -s.goal.y);
+      const gs = 1 + Math.sin(t * 4) * .15;
+      this.goalRing.scale.set(gs, gs, gs);
+    }
+    /* trail breadcrumbs */
+    const tp = this.trailGeo.attributes.position.array;
+    const lx = tp[(this.trailN - 1) * 3], lz = tp[(this.trailN - 1) * 3 + 2];
+    const gx = this.group.position.x, gz = this.group.position.z;
+    if (this.trailN === 0 || Math.hypot(gx - lx, gz - lz) > .08) {
+      if (this.trailN >= this.TRAIL) { tp.copyWithin(0, 3); this.trailN = this.TRAIL - 1; }
+      tp[this.trailN * 3] = gx; tp[this.trailN * 3 + 1] = .05; tp[this.trailN * 3 + 2] = gz;
+      this.trailN++;
+      this.trailGeo.setDrawRange(0, this.trailN);
+      this.trailGeo.attributes.position.needsUpdate = true;
+    }
+    /* cosmetic animations */
+    this.beam.rotation.y = t * 7;
+    this.wheels.forEach(w => w.rotation.y += s.cmd.lin * dt * 6);
+    const ps = 1 + Math.sin(t * 4) * .18;
+    this.pulse.scale.set(ps, ps, ps);
+    this.pulse.material.opacity = .5 + Math.sin(t * 4) * .3;
+  }
+}
+src/simulation/Simulator.js
+/**
+ * Simulator.js — FAKE ROBOT WHEN ROS IS DISCONNECTED
+ * ===================================================
+ * Runs the SAME state machine your real follower_controller will run,
+ * so you can design/test dashboard behavior with zero hardware:
+ *
+ *   MANUAL          → integrate joystick cmd into pose (unicycle model)
+ *   PERSON_FOLLOW   → simple P-controller chases a fake walking person
+ *   AUTONOMOUS_NAV  → P-controller drives to the clicked goal
+ *   STOP            → zero velocity
+ *
+ * When you write the real follower_controller in ROS2 Python/C++, use
+ * this file as your reference — the control math is identical.
+ */
+import { state } from '../robot/RobotState.js';
+export class Simulator {
+  constructor(twin) {
+    this.twin = twin;
+    this.scanTimer = 0;
+    this.personAngle = 0;               // fake person walks a circle
+  }
+  update(dt, t) {
+    const s = state;
+    /* ---------- fake person walking a slow circle (world frame) ---------- */
+    this.personAngle += dt * 0.25;
+    const pwx = Math.cos(this.personAngle) * 4;   // person world x
+    const pwy = Math.sin(this.personAngle) * 4;   // person world y
+    /* transform WORLD → ROBOT frame (this is what TF does in ROS!):
+       rotate the world-offset by -yaw                                 */
+    const dx = pwx - s.target.x, dy = pwy - s.target.y;
+    const cos = Math.cos(-s.target.yaw), sin = Math.sin(-s.target.yaw);
+    const rx = dx * cos - dy * sin;   // forward
+    const ry = dx * sin + dy * cos;   // left
+    const dist = Math.hypot(rx, ry);
+    /* pretend the camera has ~100° FOV and 6m range */
+    const bearing = Math.atan2(ry, rx);
+    if (dist < 6 && Math.abs(bearing) < 0.9) {
+      s.person.x = rx; s.person.y = ry;
+      s.person.distance = dist; s.person.bearing = bearing;
+      s.person.visible = true; s.person.lastSeen = performance.now();
+    } else {
+      s.person.visible = false;
+    }
+    /* ---------- pick velocity based on mode ---------- */
+    let lin = 0, ang = 0;
+    if (s.mode === 'MANUAL') {
+      lin = s.cmd.lin; ang = s.cmd.ang;
+    } else if (s.mode === 'PERSON_FOLLOW' && s.person.visible) {
+      /* P-controller: keep 1.2 m behind the person, face them.
+         THIS is the algorithm your follower_controller node will run! */
+      const KEEP = 1.2;
+      ang = 1.5 * bearing;                              // turn toward person
+      lin = Math.max(0, Math.min(0.8, 0.6 * (dist - KEEP))); // approach
+      s.robotStatus = `SIM: FOLLOWING @${dist.toFixed(1)}m`;
+    } else if (s.mode === 'AUTONOMOUS_NAV' && s.goal) {
+      const gdx = s.goal.x - s.target.x, gdy = s.goal.y - s.target.y;
+      const gDist = Math.hypot(gdx, gdy);
+      let gBear = Math.atan2(gdy, gdx) - s.target.yaw;
+      while (gBear > Math.PI) gBear -= 2 * Math.PI;
+      while (gBear < -Math.PI) gBear += 2 * Math.PI;
+      if (gDist > 0.15) {
+        ang = 2.0 * gBear;
+        lin = Math.abs(gBear) < 0.5 ? Math.min(0.8, gDist) : 0; // turn first, then go
+        s.robotStatus = `SIM: NAV ${gDist.toFixed(1)}m TO GOAL`;
+        this.twin.setPath([{ x: s.target.x, y: s.target.y }, s.goal]); // straight-line "plan"
+      } else {
+        s.goal = null;                                  // arrived!
+        this.twin.setPath([]);
+        s.robotStatus = 'SIM: GOAL REACHED ✔';
+      }
+    }
+    if (s.estop || s.mode === 'STOP') { lin = 0; ang = 0; }
+    /* report auto-mode velocity so HUD/wheels show it */
+    if (s.mode !== 'MANUAL') { s.cmd.lin = lin; s.cmd.ang = ang; }
+    /* ---------- unicycle model integration (like /odom would report) ---- */
+    s.target.yaw += ang * dt;
+    s.target.x += lin * Math.cos(s.target.yaw) * dt;
+    s.target.y += lin * Math.sin(s.target.yaw) * dt;
+    /* ---------- fake lidar: circular wall radius 9m, 5 Hz ---------- */
+    this.scanTimer += dt;
+    if (this.scanTimer > 0.2) {
+      this.scanTimer = 0;
+      const N = 180, ranges = [];
+      for (let i = 0; i < N; i++) {
+        const a = -Math.PI + i * (2 * Math.PI / N), ga = s.target.yaw + a;
+        const cdx = Math.cos(ga), cdy = Math.sin(ga);
+        const b = s.target.x * cdx + s.target.y * cdy;
+        const disc = b * b - (s.target.x ** 2 + s.target.y ** 2 - 81);
+        ranges.push(disc < 0 ? Infinity : (-b + Math.sqrt(disc)) + (Math.random() - .5) * .1);
+      }
+      this.twin.setScan({ ranges, angle_min: -Math.PI, angle_increment: 2 * Math.PI / N, range_max: 12 });
+    }
+  }
+}
+src/ui/Dashboard.js
+/**
+ * Dashboard.js — ALL DOM / HUD / INPUT
+ * =====================================
+ * Reads state → updates panels. Reads inputs → writes state.
+ * Knows NOTHING about Three.js or ROS internals (only calls the
+ * publish callbacks main.js gives it).
+ */
+import { state, trackingStatus } from '../robot/RobotState.js';
+const $ = id => document.getElementById(id);
+export class Dashboard {
+  /** @param {object} actions {onConnectClick, onModeChange} from main.js */
+  constructor(actions) {
+    this.keys = {};
+    this.joy = { x: 0, y: 0, on: false };
+    /* ---- keyboard ---- */
+    addEventListener('keydown', e => {
+      this.keys[e.key.toLowerCase()] = true;
+      if (e.key === ' ') { this.toggleEstop(); e.preventDefault(); }
+      if (e.key.toLowerCase() === 'c') {
+        state.camMode = (state.camMode + 1) % 4;
+        $('dCam').textContent = ['ORBIT', 'CHASE', 'TOP', 'CINEMA'][state.camMode];
+      }
+    });
+    addEventListener('keyup', e => this.keys[e.key.toLowerCase()] = false);
+    /* ---- e-stop ---- */
+    $('estop').onclick = () => this.toggleEstop();
+    /* ---- mode selector buttons → /robot_mode ---- */
+    document.querySelectorAll('.mbtn').forEach(btn => {
+      btn.onclick = () => {
+        state.mode = btn.dataset.mode;
+        document.querySelectorAll('.mbtn').forEach(b =>
+          b.classList.toggle('active', b === btn));
+        this.log(`MODE → ${state.mode}`, 'w');
+        actions.onModeChange(state.mode);   // publishes std_msgs/String
+      };
+    });
+    /* ---- connect button ---- */
+    $('connectBtn').onclick = actions.onConnectClick;
+    /* ---- speed sliders ---- */
+    $('maxLin').oninput = e => { state.limits.lin = +e.target.value; $('vLin').textContent = e.target.value; };
+    $('maxAng').oninput = e => { state.limits.ang = +e.target.value; $('vAng').textContent = e.target.value; };
+    /* ---- joystick (pointer events = mouse + touch) ---- */
+    const zone = $('joyZone'), knob = $('joyKnob');
+    const move = e => {
+      const r = zone.getBoundingClientRect();
+      let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+      const max = r.width / 2 - 25, d = Math.hypot(dx, dy);
+      if (d > max) { dx *= max / d; dy *= max / d; }
+      knob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+      this.joy.x = dx / max; this.joy.y = -dy / max;
+    };
+    const end = () => { this.joy = { x: 0, y: 0, on: false }; knob.style.transform = 'translate(-50%,-50%)'; };
+    zone.addEventListener('pointerdown', e => { this.joy.on = true; zone.setPointerCapture(e.pointerId); move(e); });
+    zone.addEventListener('pointermove', e => this.joy.on && move(e));
+    zone.addEventListener('pointerup', end);
+    zone.addEventListener('pointercancel', end);
+    this.log('DECK v2 ONLINE. SIM MODE ACTIVE.');
+    this.log('DOUBLE-CLICK FLOOR TO SET NAV GOAL.');
+  }
+  toggleEstop() {
+    state.estop = !state.estop;
+    $('estop').classList.toggle('armed', state.estop);
+    $('estop').textContent = state.estop ? 'STOPPED' : 'E-STOP';
+    this.log(state.estop ? '⛔ EMERGENCY STOP' : '✅ E-STOP RELEASED', state.estop ? 'e' : 'l');
+  }
+  log(m, c = 'l') {
+    const d = $('logInner');
+    d.innerHTML += `<div class="${c}">[${new Date().toLocaleTimeString()}] ${m}</div>`;
+    while (d.children.length > 8) d.removeChild(d.firstChild);
+  }
+  setConnected(on) {
+    $('statusDot').classList.toggle('ok', on);
+    $('statusTxt').textContent = on ? 'LINK ACTIVE' : 'OFFLINE — SIM MODE';
+    $('connectBtn').textContent = on ? '▸ SEVER LINK' : '▸ ESTABLISH LINK';
+    $('connectBtn').classList.toggle('on', on);
+    $('camOff').style.display = on ? 'none' : 'block';
+  }
+  setCameraFrame(dataUrl) { $('camImg').src = dataUrl; }
+  /** Read keys+joystick → state.want (only used in MANUAL mode). */
+  readInput() {
+    const boost = this.keys['shift'] ? 1.8 : 1;
+    let L = 0, A = 0;
+    if (this.keys['w'] || this.keys['arrowup']) L += 1;
+    if (this.keys['s'] || this.keys['arrowdown']) L -= 1;
+    if (this.keys['a'] || this.keys['arrowleft']) A += 1;
+    if (this.keys['d'] || this.keys['arrowright']) A -= 1;
+    if (this.joy.on) { L = this.joy.y; A = -this.joy.x; }
+    state.want.lin = L * state.limits.lin * boost;
+    state.want.ang = A * state.limits.ang * boost;
+  }
+  /** Refresh HUD from state — called every frame. */
+  refresh() {
+    const s = state;
+    $('dLin').textContent = s.cmd.lin.toFixed(2) + ' m/s';
+    $('dAng').textContent = s.cmd.ang.toFixed(2) + ' r/s';
+    $('dX').textContent = s.pose.x.toFixed(2);
+    $('dY').textContent = s.pose.y.toFixed(2);
+    $('dYaw').textContent = (s.pose.yaw * 57.2958).toFixed(1) + '°';
+    $('dGoal').textContent = s.goal ? `${s.goal.x.toFixed(1)}, ${s.goal.y.toFixed(1)}` : 'NONE';
+    $('dStatus').textContent = s.robotStatus;
+    if (s.battery !== null) {
+      $('dBatt').textContent = s.battery.toFixed(0) + '%';
+      $('battBar').style.width = s.battery + '%';
+    }
+    /* person tracking panel */
+    const tr = trackingStatus(), el = $('dTrack');
+    el.textContent = tr === 'FOLLOWING' ? '◉ FOLLOWING' : tr === 'DETECTED' ? '◎ DETECTED'
+                   : tr === 'LOST' ? '⚠ TARGET LOST' : 'NO TARGET';
+    el.className = tr === 'FOLLOWING' ? 'following' : tr === 'LOST' ? 'lost'
+                 : tr === 'NO TARGET' ? 'none' : '';
+    $('dDist').textContent = s.person.visible ? s.person.distance.toFixed(2) + ' m' : '-- m';
+    $('dBear').textContent = s.person.visible ? (s.person.bearing * 57.3).toFixed(0) + '°' : '--°';
+  }
+}
+src/main.js
+/**
+ * main.js — COMPOSITION ROOT
+ * ===========================
+ * Builds the scene, creates all modules, wires them together,
+ * and runs the render loop. This is the ONLY file that knows
+ * about every other module.
+ */
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { state } from './robot/RobotState.js';
+import { connect, disconnect } from './ros/connection.js';
+import { initTopics, teardownTopics, publishCmdVel, publishGoal, publishMode } from './ros/topics.js';
+import { RobotTwin } from './robot/RobotTwin.js';
+import { Simulator } from './simulation/Simulator.js';
+import { Dashboard } from './ui/Dashboard.js';
+const $ = id => document.getElementById(id);
+/* ============================ SCENE ============================ */
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x02020a, 0.028);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, .1, 400);
+camera.position.set(5, 4, 6);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.prepend(renderer.domElement);
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.25, .7, .12);
+composer.addPass(bloom);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.maxPolarAngle = Math.PI / 2.05;
+scene.add(new THREE.AmbientLight(0x334466, 1.2));
+const key = new THREE.PointLight(0x00fff7, 60, 40); key.position.set(4, 8, 4); scene.add(key);
+const rim = new THREE.PointLight(0xff00e5, 40, 40); rim.position.set(-6, 5, -4); scene.add(rim);
+/* neon floor + grid + rings (unchanged from v1) */
+const grid = new THREE.GridHelper(300, 150, 0xff00e5, 0x00fff7);
+grid.material.transparent = true; grid.material.opacity = .28; scene.add(grid);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(300, 300),
+  new THREE.MeshStandardMaterial({ color: 0x02030f, metalness: .9, roughness: .4 }));
+floor.rotation.x = -Math.PI / 2; floor.position.y = -0.01; scene.add(floor);
+for (let i = 1; i <= 4; i++) {
+  const ring = new THREE.Mesh(new THREE.RingGeometry(i * 6 - .05, i * 6 + .05, 128),
+    new THREE.MeshBasicMaterial({ color: 0x00fff7, transparent: true, opacity: .18, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; ring.position.y = .005; scene.add(ring);
+}
+/* ============================ MODULES ============================ */
+const twin = new RobotTwin(scene);
+const sim = new Simulator(twin);
+const dashboard = new Dashboard({
+  onModeChange: (mode) => publishMode(mode),   // → /robot_mode
+  onConnectClick: () => {
+    if (state.connected) { disconnect(); return; }
+    const url = $('wsUrl').value.trim();
+    dashboard.log(`LINKING → ${url} ...`, 'w');
+    connect(url, {
+      onConnect: (ros) => {
+        dashboard.setConnected(true);
+        dashboard.log('CONNECTION ESTABLISHED ⚡');
+        // create every publisher/subscriber, reading topic names from the UI
+        initTopics(ros, {
+          cmd: $('tCmd').value, odom: $('tOdom').value, scan: $('tScan').value,
+          person: $('tPerson').value, cam: $('tCam').value,
+        }, {
+          onScan: (msg) => twin.setScan(msg),
+          onImage: (url) => dashboard.setCameraFrame(url),
+          onPath: (pts) => twin.setPath(pts),
+        });
+        publishMode(state.mode);   // tell the robot our current mode
+      },
+      onError: () => dashboard.log('LINK ERROR — CHECK ROSBRIDGE', 'e'),
+      onClose: () => {
+        teardownTopics();          // unsubscribe everything (no leaks)
+        dashboard.setConnected(false);
+        dashboard.log('LINK TERMINATED — SIM MODE', 'w');
+      },
+    });
+  },
+});
+/* teleop publisher: fixed 10 Hz, independent of render framerate.
+   Robots expect a steady cmd_vel stream — many stop if it goes silent. */
+setInterval(publishCmdVel, 100);
+/* ============================ CLICK-TO-GOAL ============================
+   Raycast the mouse into the 3D scene, intersect with the floor plane,
+   convert three.js coords back to ROS coords, publish /goal_pose.
+   (Double-click so orbiting the camera doesn't set goals accidentally.) */
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+renderer.domElement.addEventListener('dblclick', (e) => {
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hit = raycaster.intersectObject(floor)[0];
+  if (!hit) return;
+  const gx = hit.point.x, gy = -hit.point.z;        // three → ROS
+  state.goal = { x: gx, y: gy };
+  publishGoal(gx, gy);                              // → /goal_pose (Nav2-compatible)
+  dashboard.log(`GOAL SET → (${gx.toFixed(2)}, ${gy.toFixed(2)})`);
+  if (state.connected) twin.setPath([]);            // real path comes from /plan
+});
+/* ============================ MAIN LOOP ============================ */
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), .05), t = clock.elapsedTime;
+  /* input → smoothed command (only drives robot in MANUAL mode) */
+  dashboard.readInput();
+  if (state.mode === 'MANUAL') {
+    state.cmd.lin += (state.want.lin - state.cmd.lin) * Math.min(1, dt * 8);
+    state.cmd.ang += (state.want.ang - state.cmd.ang) * Math.min(1, dt * 8);
+  }
+  if (state.estop || state.mode === 'STOP') { state.cmd.lin = 0; state.cmd.ang = 0; }
+  /* SIM MODE: when disconnected, the Simulator plays the role of
+     ALL your ROS nodes (odometry, vision_node, follower_controller). */
+  if (!state.connected) sim.update(dt, t);
+  twin.update(dt, t);
+  dashboard.refresh();
+  /* cameras (press C to cycle) */
+  const rp = twin.group.position;
+  if (state.camMode === 0) { controls.target.lerp(rp.clone().setY(.4), .06); controls.update(); }
+  else if (state.camMode === 1) {
+    const b = new THREE.Vector3(-4.2, 2.6, 0)
+      .applyAxisAngle(new THREE.Vector3(0, 1, 0), state.pose.yaw).add(rp);
+    camera.position.lerp(b, .07); camera.lookAt(rp.clone().setY(.5));
+  }
+  else if (state.camMode === 2) { camera.position.lerp(rp.clone().add(new THREE.Vector3(0, 17, .01)), .07); camera.lookAt(rp); }
+  else { camera.position.lerp(new THREE.Vector3(Math.cos(t * .25) * 8, 4.5, Math.sin(t * .25) * 8).add(rp), .05); camera.lookAt(rp); }
+  bloom.strength = 1.15 + Math.abs(state.cmd.lin) * .5;
+  composer.render();
+}
+animate();
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
+});
+4. Running It
+ES modules require an HTTP server (opening index.html directly will fail with CORS errors):
+
+cd project/
+python3 -m http.server 8000     # → http://localhost:8000
+# On the robot / ROS machine:
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+Test the new features from a terminal (before writing your nodes):
+
+# Fake a person detection 2m ahead, 0.5m left:
+ros2 topic pub /person_position geometry_msgs/msg/PointStamped \
+  '{header: {frame_id: base_link}, point: {x: 2.0, y: 0.5, z: 0.0}}' -r 5
+# Fake a status message:
+ros2 topic pub /robot_status std_msgs/msg/String '{data: "SEARCHING FOR PERSON"}'
+# Watch what the mode buttons publish:
+ros2 topic echo /robot_mode
+# Watch what floor double-clicks publish:
+ros2 topic echo /goal_pose
+5. Your ROS2 To-Do List (the dashboard is now waiting for these)
+Node you'll write	Subscribes	Publishes	Dashboard shows it as
+camera_node	—	/camera/image/compressed	Camera panel
+vision_node	/image_raw	/person_position (PointStamped, base_link frame)	Pink person + tracking panel
+follower_controller	/person_position, /robot_mode	/cmd_vel, /robot_status	Robot moves, STATUS row
+(later) Nav2	/goal_pose	/plan, /cmd_vel	Green goal marker + path line

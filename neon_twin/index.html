@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Person Follower — Digital Twin</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#f4f5f7; --panel:#ffffff; --line:#e2e4e8; --line2:#eef0f3;
+    --ink:#1a1d21; --muted:#6b7280; --faint:#9aa1ac;
+    --accent:#2563eb; --ok:#16a34a; --warn:#d97706; --err:#dc2626;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);
+    font-family:'Inter',system-ui,sans-serif;color:var(--ink);
+    -webkit-font-smoothing:antialiased}
+  canvas{display:block}
+  .panel{position:fixed;z-index:60;background:var(--panel);border:1px solid var(--line);
+    box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 12px rgba(16,24,40,.06);
+    padding:14px 16px;border-radius:10px}
+  h1{font-size:15px;font-weight:700;letter-spacing:-.2px;color:var(--ink)}
+  .sub{font-size:11px;font-weight:500;color:var(--muted);margin-top:2px}
+  .ptitle{font-size:10px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;
+    color:var(--faint);margin-bottom:10px}
+  #titlePanel{top:16px;left:16px;padding:12px 16px}
+  #connPanel{top:16px;right:16px;width:264px;max-height:calc(100vh - 180px);overflow-y:auto}
+  #telemetry{bottom:16px;left:16px;width:248px;font-size:12px}
+  #personPanel{top:16px;left:50%;transform:translateX(-50%);width:220px;text-align:center}
+  #modePanel{top:104px;left:16px;width:200px}
+  #camPanel{bottom:16px;left:280px;width:280px}
+  #camImg{width:100%;height:158px;object-fit:cover;background:#0f1115;
+    border:1px solid var(--line);border-radius:6px;display:block}
+  #camOff{font-size:11px;color:var(--muted);text-align:center;padding:8px 0 2px}
+  #logPanel{bottom:16px;left:576px;width:300px;height:118px;overflow:hidden;
+    font-family:'Roboto Mono',monospace;font-size:11px;line-height:1.55;color:var(--muted)}
+  #logPanel .l{color:var(--ok)} #logPanel .w{color:var(--warn)} #logPanel .e{color:var(--err)}
+  label{font-size:11px;font-weight:500;color:var(--muted);display:block;margin-top:12px}
+  input[type=text]{width:100%;background:#fff;border:1px solid var(--line);border-radius:6px;
+    color:var(--ink);font-family:'Roboto Mono',monospace;font-size:12px;padding:7px 9px;
+    outline:none;margin-top:4px;transition:border-color .15s}
+  input[type=text]:focus{border-color:var(--accent)}
+  input[type=range]{width:100%;accent-color:var(--accent);margin-top:6px}
+  .btn{width:100%;margin-top:16px;padding:10px;background:var(--accent);border:1px solid var(--accent);
+    color:#fff;border-radius:8px;font-family:inherit;font-size:13px;font-weight:600;
+    cursor:pointer;transition:.15s}
+  .btn:hover{background:#1d4ed8}
+  .btn.on{background:var(--ok);border-color:var(--ok)}
+  .mbtn{display:flex;align-items:center;gap:8px;width:100%;margin-top:6px;padding:9px 11px;
+    background:#fff;border:1px solid var(--line);color:var(--ink);border-radius:8px;
+    font-family:inherit;font-size:12px;font-weight:500;cursor:pointer;transition:.12s;text-align:left}
+  .mbtn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
+  .mbtn:hover{border-color:var(--accent);background:#f8faff}
+  .mbtn.active{border-color:var(--accent);background:#eff5ff;color:var(--accent);font-weight:600}
+  .mbtn.active::before{background:var(--accent)}
+  .mbtn.stop.active{border-color:var(--err);background:#fef2f2;color:var(--err)}
+  .mbtn.stop.active::before{background:var(--err)}
+  .row{display:flex;justify-content:space-between;align-items:baseline;margin:5px 0}
+  .row span{color:var(--muted);font-size:12px}
+  .row b{color:var(--ink);font-family:'Roboto Mono',monospace;font-weight:500;font-size:12px}
+  #dTrack{font-size:14px;font-weight:600;margin-bottom:8px}
+  #dTrack.following{color:var(--ok)}
+  #dTrack.lost{color:var(--warn)} #dTrack.none{color:var(--faint)}
+  #statusDot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--faint);
+    margin-right:8px;vertical-align:middle}
+  #statusDot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.15)}
+  #statusTxt{font-size:12px;font-weight:600}
+  #battWrap{height:8px;border:1px solid var(--line);border-radius:4px;margin-top:6px;overflow:hidden;background:var(--line2)}
+  #battBar{height:100%;width:100%;background:var(--ok);transition:width .5s}
+  #estop{position:fixed;bottom:16px;right:16px;z-index:60;width:96px;height:96px;border-radius:50%;
+    background:var(--err);border:none;color:#fff;font-family:inherit;font-weight:700;font-size:13px;
+    letter-spacing:.5px;cursor:pointer;box-shadow:0 4px 14px rgba(220,38,38,.35);transition:.15s}
+  #estop:hover{background:#b91c1c}
+  #estop.armed{animation:alarm .5s infinite}
+  @keyframes alarm{50%{box-shadow:0 0 0 10px rgba(220,38,38,.25)}}
+  #hint{position:fixed;bottom:126px;right:16px;z-index:60;font-size:11px;text-align:right;
+    color:var(--muted);line-height:1.7}
+  #hint b{color:var(--ink);font-weight:600}
+  #joyZone{position:fixed;bottom:150px;left:50%;transform:translateX(-50%);z-index:60;
+    width:132px;height:132px;border-radius:50%;border:1px solid var(--line);
+    background:rgba(255,255,255,.7);box-shadow:0 2px 8px rgba(16,24,40,.06);touch-action:none}
+  #joyKnob{position:absolute;left:50%;top:50%;width:48px;height:48px;border-radius:50%;
+    transform:translate(-50%,-50%);background:var(--accent);
+    box-shadow:0 2px 8px rgba(37,99,235,.4);pointer-events:none}
+  @media (max-width:1000px){#logPanel,#hint,#personPanel,#camPanel{display:none}}
+</style>
+</head>
+<body>
+<div class="panel" id="titlePanel">
+  <h1>Person Follower</h1>
+  <div class="sub">ROS2 · YOLOv8 · Digital Twin</div>
+</div>
+<div class="panel" id="modePanel">
+  <div class="ptitle">Robot Mode</div>
+  <button class="mbtn active" data-mode="MANUAL">Manual</button>
+  <button class="mbtn" data-mode="PERSON_FOLLOW">Person Follow</button>
+  <button class="mbtn" data-mode="AUTONOMOUS_NAV">Autonomous Nav</button>
+  <button class="mbtn stop" data-mode="STOP">Stop</button>
+</div>
+<div class="panel" id="personPanel">
+  <div class="ptitle">Target Tracking</div>
+  <div id="dTrack" class="none">No Target</div>
+  <div class="row"><span>Distance</span><b id="dDist">-- m</b></div>
+  <div class="row"><span>Bearing</span><b id="dBear">--°</b></div>
+</div>
+<div class="panel" id="connPanel">
+  <div><span id="statusDot"></span><span id="statusTxt">Offline — Sim Mode</span></div>
+  <label>Rosbridge URL</label><input type="text" id="wsUrl" value="ws://localhost:9090">
+  <label>cmd_vel topic</label><input type="text" id="tCmd" value="/cmd_vel">
+  <label>odom topic</label><input type="text" id="tOdom" value="/odom">
+  <label>scan topic</label><input type="text" id="tScan" value="/scan">
+  <label>person topic</label><input type="text" id="tPerson" value="/person_position">
+  <label>camera topic</label><input type="text" id="tCam" value="/camera/image/compressed">
+  <label>Max linear <span id="vLin">0.6</span> m/s</label>
+  <input type="range" id="maxLin" min="0.1" max="2" step="0.05" value="0.6">
+  <label>Max angular <span id="vAng">1.5</span> rad/s</label>
+  <input type="range" id="maxAng" min="0.2" max="4" step="0.1" value="1.5">
+  <button class="btn" id="connectBtn">Establish Link</button>
+</div>
+<div class="panel" id="telemetry">
+  <div class="ptitle">Telemetry</div>
+  <div class="row"><span>Lin vel</span><b id="dLin">0.00 m/s</b></div>
+  <div class="row"><span>Ang vel</span><b id="dAng">0.00 r/s</b></div>
+  <div class="row"><span>Pos x / y</span><b><span id="dX">0.00</span> / <span id="dY">0.00</span></b></div>
+  <div class="row"><span>Yaw</span><b id="dYaw">0.0°</b></div>
+  <div class="row"><span>Goal</span><b id="dGoal">None</b></div>
+  <div class="row"><span>Status</span><b id="dStatus">—</b></div>
+  <div class="row"><span>Camera</span><b id="dCam">Orbit</b></div>
+  <div class="row"><span>Battery</span><b id="dBatt">--%</b></div>
+  <div id="battWrap"><div id="battBar"></div></div>
+</div>
+<div class="panel" id="camPanel">
+  <div class="ptitle">Robot Camera</div>
+  <img id="camImg" alt="">
+  <div id="camOff">No signal — connect to ROS</div>
+</div>
+<div class="panel" id="logPanel"><div id="logInner"></div></div>
+<div id="hint">
+  <b>W/S/A/D</b> drive (manual) &nbsp;<b>Shift</b> boost<br>
+  <b>Double-click floor</b> set nav goal<br>
+  <b>C</b> camera &nbsp;<b>Space</b> e-stop
+</div>
+<button id="estop">E-STOP</button>
+<div id="joyZone"><div id="joyKnob"></div></div>
+<script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
